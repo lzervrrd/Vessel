@@ -11,6 +11,7 @@
   body { margin:0; background:#0a0f1a; color:#e2e8f0; font-family:'Courier New', monospace; }
   input, select, textarea, button { font-family:inherit; }
   * { box-sizing:border-box; }
+  img { display:block; }
 </style>
 </head>
 <body>
@@ -19,192 +20,303 @@
 <script type="text/babel">
 const { useState, useEffect } = React;
 
-// ─── YOUR AIRTABLE BASE (safe to be public — these are just IDs, not secrets) ──
+// ─── YOUR AIRTABLE BASE (IDs are not secrets) ──────────────────────────────
 const BASE = "appCee7vxeepE36Qw";
-const TABLES = {
-  trips:   "tbleTAeXM8XjmCapU",
-  fillups: "tbl3vnAiUAEJEXQyR",
-  expenses:"tblJV5Fvz9WJeJEFh",
-};
+const TABLES = { trips:"tbleTAeXM8XjmCapU", fillups:"tbl3vnAiUAEJEXQyR", expenses:"tblJV5Fvz9WJeJEFh" };
 const OWNERS = ["Bob", "Jamie", "Tucker"];
 const CATS = ["Maintenance","Engine","Electrical","Safety","Registration","Moorage","Other"];
+const GAS_FALLBACK = 6;        // $/gal when there are no fill-ups
+const PRICE_WINDOW_GAL = 50;   // average price over most-recent this-many gallons
 
-// en-dash field names from the base
-const F = {
-  gasOwed: (o) => `${o} \u2013 Gas Owed`,
-  gasPaid: (o) => `${o} \u2013 Gas Paid`,
-  expNet:  (o) => `${o} \u2013 Net`,
-};
-
-// ─── TOKEN (kept in this browser only; never in the repo) ──────────────────
-function getToken() { return localStorage.getItem("vessel_pat") || ""; }
-function setToken(t) { localStorage.setItem("vessel_pat", t); }
-function clearToken() { localStorage.removeItem("vessel_pat"); }
+// ─── TOKEN (this browser only; never in the repo) ──────────────────────────
+const getToken = () => localStorage.getItem("vessel_pat") || "";
+const setToken = (t) => localStorage.setItem("vessel_pat", t);
+const clearToken = () => localStorage.removeItem("vessel_pat");
 
 // ─── AIRTABLE API ──────────────────────────────────────────────────────────
 async function atListAll(tableId) {
-  const token = getToken();
-  let records = [], offset;
+  const token = getToken(); let records = [], offset;
   do {
     const url = new URL(`https://api.airtable.com/v0/${BASE}/${tableId}`);
-    url.searchParams.set("pageSize", "100");
+    url.searchParams.set("pageSize","100");
     if (offset) url.searchParams.set("offset", offset);
-    const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+    const res = await fetch(url, { headers:{ Authorization:`Bearer ${token}` } });
     if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
     const data = await res.json();
-    records = records.concat(data.records);
-    offset = data.offset;
+    records = records.concat(data.records); offset = data.offset;
   } while (offset);
   return records;
 }
-
 async function atCreate(tableId, fields) {
-  const token = getToken();
   const res = await fetch(`https://api.airtable.com/v0/${BASE}/${tableId}`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ typecast: true, records: [{ fields }] }),
+    method:"POST", headers:{ Authorization:`Bearer ${getToken()}`, "Content-Type":"application/json" },
+    body: JSON.stringify({ typecast:true, records:[{ fields }] }),
   });
-  if (!res.ok) throw new Error(`${res.status} — ${(await res.text()).slice(0,200)}`);
+  if (!res.ok) throw new Error(`${res.status} — ${(await res.text()).slice(0,160)}`);
+  return res.json();
+}
+async function atUpdate(tableId, recordId, fields) {
+  const res = await fetch(`https://api.airtable.com/v0/${BASE}/${tableId}/${recordId}`, {
+    method:"PATCH", headers:{ Authorization:`Bearer ${getToken()}`, "Content-Type":"application/json" },
+    body: JSON.stringify({ typecast:true, fields }),
+  });
+  if (!res.ok) throw new Error(`${res.status} — ${(await res.text()).slice(0,160)}`);
+  return res.json();
+}
+async function atDelete(tableId, recordId) {
+  const res = await fetch(`https://api.airtable.com/v0/${BASE}/${tableId}/${recordId}`, {
+    method:"DELETE", headers:{ Authorization:`Bearer ${getToken()}` },
+  });
+  if (!res.ok) throw new Error(`${res.status}`);
+  return res.json();
+}
+// Upload a photo straight to a record's Photos field (base64, ≤5MB)
+function fileToB64(file){ return new Promise((res,rej)=>{ const r=new FileReader(); r.onload=()=>res(String(r.result).split(",")[1]); r.onerror=rej; r.readAsDataURL(file); }); }
+async function atUploadPhoto(recordId, file) {
+  const b64 = await fileToB64(file);
+  const res = await fetch(`https://content.airtable.com/v0/${BASE}/${recordId}/Photos/uploadAttachment`, {
+    method:"POST", headers:{ Authorization:`Bearer ${getToken()}`, "Content-Type":"application/json" },
+    body: JSON.stringify({ contentType:file.type, file:b64, filename:file.name }),
+  });
+  if (!res.ok) throw new Error(`Photo upload: ${res.status} — ${(await res.text()).slice(0,160)}`);
   return res.json();
 }
 
-const sum = (rows, key) => rows.reduce((s, r) => s + (Number(r.fields[key]) || 0), 0);
+// ─── HELPERS ─────────────────────────────────────────────────────────────────
 const $m = (n) => Math.round(n).toLocaleString();
+const today = () => new Date().toISOString().slice(0,10);
+const thumb = (att) => (att && (att.thumbnails?.large?.url || att.thumbnails?.small?.url || att.url)) || "";
 
-// ─── TOKEN SETUP SCREEN ─────────────────────────────────────────────────────
+// Live gas price: weighted avg over most-recent fill-ups up to PRICE_WINDOW_GAL gallons
+function gasPrice(fillups) {
+  const fs = fillups.filter(f => Number(f.fields["Gallons"]) > 0)
+    .sort((a,b) => (a.fields["Date"] < b.fields["Date"] ? 1 : -1));
+  let gal = 0, cost = 0;
+  for (const f of fs) {
+    gal += Number(f.fields["Gallons"]) || 0;
+    cost += Number(f.fields["Total Cost"]) || 0;
+    if (gal >= PRICE_WINDOW_GAL) break;
+  }
+  return gal > 0 ? cost / gal : GAS_FALLBACK;
+}
+
+function computeBalances(data, price) {
+  return OWNERS.map(o => {
+    let gasPaid = 0, gasOwed = 0, expNet = 0;
+    data.fillups.forEach(f => { if (f.fields["Paid By"] === o) gasPaid += Number(f.fields["Total Cost"])||0; });
+    data.trips.forEach(t => {
+      const who = t.fields["Who Went"] || [];
+      if (!t.fields["Short Trip (no gas)"] && who.length && who.includes(o))
+        gasOwed += ((Number(t.fields["Estimated Gallons"])||0) * price) / who.length;
+    });
+    data.expenses.forEach(e => {
+      const total = Number(e.fields["Total Cost"])||0;
+      const split = (e.fields["Split Among"]&&e.fields["Split Among"].length) ? e.fields["Split Among"] : OWNERS;
+      expNet += (e.fields["Paid By"]===o ? total : 0) - (split.includes(o) ? total/split.length : 0);
+    });
+    const gasNet = gasPaid - gasOwed;
+    return { owner:o, gasNet, expNet, total: gasNet + expNet };
+  });
+}
+
+// ─── SHARED UI BITS ────────────────────────────────────────────────────────
+function Thumbs({ photos }) {
+  if (!photos || !photos.length) return null;
+  return (
+    <div style={{ display:"flex", gap:6, flexWrap:"wrap", marginTop:8 }}>
+      {photos.map(p => <img key={p.id} src={thumb(p)} alt="" style={S.thumb} />)}
+    </div>
+  );
+}
+
+function OwnerToggle({ list, value, onToggle, multi }) {
+  return (
+    <div style={S.row}>{list.map(o => (
+      <button key={o} type="button" onClick={()=>onToggle(o)}
+        style={{ ...S.tog, ...((multi ? value.includes(o) : value===o) ? S.togOn : {}) }}>
+        {multi && value.includes(o) ? "✓ " : ""}{o}
+      </button>
+    ))}</div>
+  );
+}
+
+// Photo manager shown only when editing an existing record
+function PhotoManager({ tableId, record, onChanged }) {
+  const [busy, setBusy] = useState(false);
+  const photos = record.fields["Photos"] || [];
+  const onPick = async (e) => {
+    const file = e.target.files[0]; if (!file) return;
+    if (file.size > 5*1024*1024) { alert("Photo must be under 5 MB."); return; }
+    setBusy(true);
+    try { await atUploadPhoto(record.id, file); await onChanged(); }
+    catch (err) { alert(err.message + "\n\nIf this is a CORS error, photo upload needs the Cloudflare Worker — ask Claude. Meanwhile the Airtable mobile app uploads reliably."); }
+    setBusy(false);
+  };
+  const removeOne = async (id) => {
+    setBusy(true);
+    try { await atUpdate(tableId, record.id, { "Photos": photos.filter(p=>p.id!==id).map(p=>({id:p.id})) }); await onChanged(); }
+    catch (err) { alert(err.message); }
+    setBusy(false);
+  };
+  return (
+    <div>
+      <label style={S.lab}>Photos</label>
+      <div style={{ display:"flex", gap:6, flexWrap:"wrap", marginBottom:8 }}>
+        {photos.map(p => (
+          <div key={p.id} style={{ position:"relative" }}>
+            <img src={thumb(p)} alt="" style={S.thumbBig} />
+            <button type="button" onClick={()=>removeOne(p.id)} style={S.thumbX}>×</button>
+          </div>
+        ))}
+      </div>
+      <label style={{ ...S.btnGhost, display:"inline-block", textAlign:"center", cursor:"pointer", opacity: busy?0.5:1 }}>
+        {busy ? "Working…" : "📷 Add Photo"}
+        <input type="file" accept="image/*" style={{ display:"none" }} disabled={busy} onChange={onPick} />
+      </label>
+    </div>
+  );
+}
+
+// ─── SETUP ───────────────────────────────────────────────────────────────────
 function Setup({ onSaved }) {
   const [val, setVal] = useState("");
   return (
-    <div style={S.setupWrap}>
-      <div style={S.setupCard}>
-        <div style={S.headerTitle}>VESSEL LOG</div>
-        <p style={{ color:"#94a3b8", fontSize:13, lineHeight:1.6 }}>
-          Paste your Airtable personal access token. It's stored only in this browser —
-          it never gets uploaded or shared. Each crew member pastes it once on their own device.
-        </p>
-        <input style={S.input} type="password" value={val} placeholder="pat..."
-          onChange={(e) => setVal(e.target.value)} />
-        <button style={{ ...S.btnPrimary, marginTop:12, width:"100%" }}
-          onClick={() => { if (val.trim()) { setToken(val.trim()); onSaved(); } }}>
-          Save & Connect
-        </button>
+    <div style={S.setupWrap}><div style={S.setupCard}>
+      <div style={S.headerTitle}>VESSEL LOG</div>
+      <p style={{ color:"#94a3b8", fontSize:13, lineHeight:1.6 }}>
+        Paste your Airtable personal access token. It's stored only in this browser —
+        never uploaded or shared. Paste the FULL value (it's long, with a period in the middle).
+      </p>
+      <input style={S.input} type="password" value={val} placeholder="pat..." onChange={e=>setVal(e.target.value)} />
+      <button style={{ ...S.btnPrimary, marginTop:12, width:"100%" }}
+        onClick={()=>{ if(val.trim()){ setToken(val.trim()); onSaved(); } }}>Save & Connect</button>
+    </div></div>
+  );
+}
+
+// ─── ENTRY MODAL (create + edit, by type) ─────────────────────────────────────
+function EntryModal({ type, initial, onClose, onSaved, refetch }) {
+  const editing = !!initial;
+  const base = initial ? { ...initial.fields } : {};
+  const [f, setF] = useState({
+    "Trip Name": base["Trip Name"] || "Day Trip",
+    "Date": base["Date"] || today(),
+    "Who Went": base["Who Went"] || [],
+    "Estimated Gallons": base["Estimated Gallons"] ?? "",
+    "Short Trip (no gas)": base["Short Trip (no gas)"] || false,
+    "Notes": base["Notes"] || "",
+    "Paid By": base["Paid By"] || "",
+    "Gallons": base["Gallons"] ?? "",
+    "Total Cost": base["Total Cost"] ?? "",
+    "Description": base["Description"] || "",
+    "Category": base["Category"] || "Maintenance",
+    "Split Among": base["Split Among"] || [...OWNERS],
+  });
+  const [busy, setBusy] = useState(false);
+  const set = (k,v) => setF(s => ({ ...s, [k]:v }));
+  const toggle = (k,o) => setF(s => ({ ...s, [k]: s[k].includes(o) ? s[k].filter(x=>x!==o) : [...s[k], o] }));
+  const tableId = TABLES[type];
+
+  const buildFields = () => {
+    if (type==="trips") return {
+      "Trip Name": f["Trip Name"], "Date": f["Date"], "Who Went": f["Who Went"],
+      "Estimated Gallons": f["Short Trip (no gas)"] ? 0 : parseFloat(f["Estimated Gallons"]||0),
+      "Short Trip (no gas)": f["Short Trip (no gas)"], "Notes": f["Notes"],
+    };
+    if (type==="fillups") return {
+      "Date": f["Date"], "Paid By": f["Paid By"],
+      "Gallons": parseFloat(f["Gallons"]||0), "Total Cost": parseFloat(f["Total Cost"]||0), "Notes": f["Notes"],
+    };
+    return {
+      "Description": f["Description"], "Category": f["Category"], "Date": f["Date"],
+      "Total Cost": parseFloat(f["Total Cost"]||0), "Paid By": f["Paid By"],
+      "Split Among": f["Split Among"].length ? f["Split Among"] : OWNERS,
+    };
+  };
+  const valid = () => {
+    if (type==="trips") return f["Trip Name"] && f["Who Went"].length;
+    if (type==="fillups") return f["Paid By"] && f["Gallons"] && f["Total Cost"];
+    return f["Description"] && f["Paid By"] && f["Total Cost"];
+  };
+  const save = async () => {
+    if (!valid()) return; setBusy(true);
+    try {
+      if (editing) await atUpdate(tableId, initial.id, buildFields());
+      else await atCreate(tableId, buildFields());
+      await onSaved();
+    } catch (e) { alert("Save failed: " + e.message); setBusy(false); }
+  };
+  const del = async () => {
+    if (!confirm("Delete this entry permanently?")) return; setBusy(true);
+    try { await atDelete(tableId, initial.id); await onSaved(); }
+    catch (e) { alert("Delete failed: " + e.message); setBusy(false); }
+  };
+
+  const title = (editing?"Edit ":"") + (type==="trips"?"⚓ Trip":type==="fillups"?"⛽ Fill-Up":"🔧 Expense");
+
+  return (
+    <div style={S.overlay} onClick={onClose}>
+      <div style={S.modal} onClick={e=>e.stopPropagation()}>
+        <div style={S.modalTitle}>{title}</div>
+
+        {type==="trips" && <>
+          <label style={S.lab}>Trip Name</label>
+          <input style={S.input} value={f["Trip Name"]} onChange={e=>set("Trip Name",e.target.value)} />
+          <label style={S.lab}>Date</label>
+          <input style={S.input} type="date" value={f["Date"]} onChange={e=>set("Date",e.target.value)} />
+          <label style={S.lab}>Who Went</label>
+          <OwnerToggle list={OWNERS} value={f["Who Went"]} multi onToggle={o=>toggle("Who Went",o)} />
+          <label style={{ ...S.lab, display:"flex", alignItems:"center", gap:8, marginTop:8 }}>
+            <input type="checkbox" checked={f["Short Trip (no gas)"]} onChange={e=>set("Short Trip (no gas)",e.target.checked)} /> Short trip (no gas charge)
+          </label>
+          {!f["Short Trip (no gas)"] && <>
+            <label style={S.lab}>Estimated Gallons</label>
+            <input style={S.input} type="number" value={f["Estimated Gallons"]} onChange={e=>set("Estimated Gallons",e.target.value)} />
+          </>}
+          <label style={S.lab}>Notes</label>
+          <input style={S.input} value={f["Notes"]} onChange={e=>set("Notes",e.target.value)} />
+        </>}
+
+        {type==="fillups" && <>
+          <label style={S.lab}>Date</label>
+          <input style={S.input} type="date" value={f["Date"]} onChange={e=>set("Date",e.target.value)} />
+          <label style={S.lab}>Paid By</label>
+          <OwnerToggle list={OWNERS} value={f["Paid By"]} onToggle={o=>set("Paid By",o)} />
+          <label style={S.lab}>Gallons</label>
+          <input style={S.input} type="number" value={f["Gallons"]} onChange={e=>set("Gallons",e.target.value)} />
+          <label style={S.lab}>Total Cost ($)</label>
+          <input style={S.input} type="number" value={f["Total Cost"]} onChange={e=>set("Total Cost",e.target.value)} />
+          <label style={S.lab}>Notes</label>
+          <input style={S.input} value={f["Notes"]} onChange={e=>set("Notes",e.target.value)} />
+        </>}
+
+        {type==="expenses" && <>
+          <label style={S.lab}>Type</label>
+          <div style={{ ...S.row, flexWrap:"wrap" }}>{CATS.map(c=>(
+            <button key={c} type="button" onClick={()=>set("Category",c)} style={{ ...S.tog, flex:"none", ...(f["Category"]===c?S.togOn:{}) }}>{c}</button>
+          ))}</div>
+          <label style={S.lab}>Description</label>
+          <input style={S.input} value={f["Description"]} onChange={e=>set("Description",e.target.value)} />
+          <label style={S.lab}>Date</label>
+          <input style={S.input} type="date" value={f["Date"]} onChange={e=>set("Date",e.target.value)} />
+          <label style={S.lab}>Total Cost ($)</label>
+          <input style={S.input} type="number" value={f["Total Cost"]} onChange={e=>set("Total Cost",e.target.value)} />
+          <label style={S.lab}>Paid By</label>
+          <OwnerToggle list={OWNERS} value={f["Paid By"]} onToggle={o=>set("Paid By",o)} />
+          <label style={S.lab}>Split Among</label>
+          <OwnerToggle list={OWNERS} value={f["Split Among"]} multi onToggle={o=>toggle("Split Among",o)} />
+        </>}
+
+        {editing
+          ? <div style={{ marginTop:12 }}><PhotoManager tableId={tableId} record={initial} onChanged={refetch} /></div>
+          : <div style={S.note}>Save first, then re-open this entry to attach photos.</div>}
+
+        <div style={S.btnRow}>
+          {editing && <button style={S.btnDelete} disabled={busy} onClick={del}>Delete</button>}
+          <button style={S.btnGhost} disabled={busy} onClick={onClose}>Cancel</button>
+          <button style={{ ...S.btnPrimary, flex:1 }} disabled={busy} onClick={save}>{busy?"Saving…":(editing?"Save":"Add")}</button>
+        </div>
       </div>
-    </div>
-  );
-}
-
-// ─── ADD FORMS ───────────────────────────────────────────────────────────────
-function TripForm({ onDone }) {
-  const [f, setF] = useState({ name:"Day Trip", date:new Date().toISOString().slice(0,10), who:[], gal:"", short:false, notes:"" });
-  const [busy, setBusy] = useState(false);
-  const toggle = (o) => setF(s => ({ ...s, who: s.who.includes(o) ? s.who.filter(x=>x!==o) : [...s.who, o] }));
-  const save = async () => {
-    if (!f.name || !f.who.length) return;
-    setBusy(true);
-    try {
-      await atCreate(TABLES.trips, {
-        "Trip Name": f.name, "Date": f.date, "Who Went": f.who,
-        "Estimated Gallons": f.short ? 0 : parseFloat(f.gal || 0),
-        "Short Trip (no gas)": f.short, "Notes": f.notes,
-      });
-      onDone();
-    } catch (e) { alert("Save failed: " + e.message); setBusy(false); }
-  };
-  return (
-    <div style={S.form}>
-      <label style={S.lab}>Trip Name</label>
-      <input style={S.input} value={f.name} onChange={e=>setF({...f,name:e.target.value})} />
-      <label style={S.lab}>Date</label>
-      <input style={S.input} type="date" value={f.date} onChange={e=>setF({...f,date:e.target.value})} />
-      <label style={S.lab}>Who Went</label>
-      <div style={S.row}>{OWNERS.map(o=>(
-        <button key={o} onClick={()=>toggle(o)} style={{...S.tog, ...(f.who.includes(o)?S.togOn:{})}}>{o}</button>
-      ))}</div>
-      <label style={{...S.lab, display:"flex", alignItems:"center", gap:8, marginTop:8}}>
-        <input type="checkbox" checked={f.short} onChange={e=>setF({...f,short:e.target.checked})} /> Short trip (no gas charge)
-      </label>
-      {!f.short && <>
-        <label style={S.lab}>Estimated Gallons</label>
-        <input style={S.input} type="number" value={f.gal} onChange={e=>setF({...f,gal:e.target.value})} />
-      </>}
-      <label style={S.lab}>Notes</label>
-      <input style={S.input} value={f.notes} onChange={e=>setF({...f,notes:e.target.value})} />
-      <button style={{...S.btnPrimary, marginTop:10}} disabled={busy} onClick={save}>{busy?"Saving…":"Log Trip"}</button>
-    </div>
-  );
-}
-
-function FillupForm({ onDone }) {
-  const [f, setF] = useState({ date:new Date().toISOString().slice(0,10), paidBy:"", gal:"", cost:"", notes:"" });
-  const [busy, setBusy] = useState(false);
-  const save = async () => {
-    if (!f.paidBy || !f.gal || !f.cost) return;
-    setBusy(true);
-    try {
-      await atCreate(TABLES.fillups, {
-        "Date": f.date, "Paid By": f.paidBy,
-        "Gallons": parseFloat(f.gal), "Total Cost": parseFloat(f.cost), "Notes": f.notes,
-      });
-      onDone();
-    } catch (e) { alert("Save failed: " + e.message); setBusy(false); }
-  };
-  return (
-    <div style={S.form}>
-      <label style={S.lab}>Date</label>
-      <input style={S.input} type="date" value={f.date} onChange={e=>setF({...f,date:e.target.value})} />
-      <label style={S.lab}>Paid By</label>
-      <div style={S.row}>{OWNERS.map(o=>(
-        <button key={o} onClick={()=>setF({...f,paidBy:o})} style={{...S.tog, ...(f.paidBy===o?S.togOn:{})}}>{o}</button>
-      ))}</div>
-      <label style={S.lab}>Gallons</label>
-      <input style={S.input} type="number" value={f.gal} onChange={e=>setF({...f,gal:e.target.value})} />
-      <label style={S.lab}>Total Cost ($)</label>
-      <input style={S.input} type="number" value={f.cost} onChange={e=>setF({...f,cost:e.target.value})} />
-      <label style={S.lab}>Notes</label>
-      <input style={S.input} value={f.notes} onChange={e=>setF({...f,notes:e.target.value})} />
-      <button style={{...S.btnPrimary, marginTop:10}} disabled={busy} onClick={save}>{busy?"Saving…":"Log Fill-Up"}</button>
-    </div>
-  );
-}
-
-function ExpenseForm({ onDone }) {
-  const [f, setF] = useState({ desc:"", cat:"Maintenance", date:new Date().toISOString().slice(0,10), cost:"", paidBy:"", split:[...OWNERS] });
-  const [busy, setBusy] = useState(false);
-  const toggle = (o) => setF(s => ({ ...s, split: s.split.includes(o) ? s.split.filter(x=>x!==o) : [...s.split, o] }));
-  const save = async () => {
-    if (!f.desc || !f.cost || !f.paidBy) return;
-    setBusy(true);
-    try {
-      await atCreate(TABLES.expenses, {
-        "Description": f.desc, "Category": f.cat, "Date": f.date,
-        "Total Cost": parseFloat(f.cost), "Paid By": f.paidBy,
-        "Split Among": f.split.length ? f.split : OWNERS,
-      });
-      onDone();
-    } catch (e) { alert("Save failed: " + e.message); setBusy(false); }
-  };
-  return (
-    <div style={S.form}>
-      <label style={S.lab}>Type</label>
-      <div style={{...S.row, flexWrap:"wrap"}}>{CATS.map(c=>(
-        <button key={c} onClick={()=>setF({...f,cat:c})} style={{...S.tog, flex:"none", ...(f.cat===c?S.togOn:{})}}>{c}</button>
-      ))}</div>
-      <label style={S.lab}>Description</label>
-      <input style={S.input} value={f.desc} onChange={e=>setF({...f,desc:e.target.value})} />
-      <label style={S.lab}>Date</label>
-      <input style={S.input} type="date" value={f.date} onChange={e=>setF({...f,date:e.target.value})} />
-      <label style={S.lab}>Total Cost ($)</label>
-      <input style={S.input} type="number" value={f.cost} onChange={e=>setF({...f,cost:e.target.value})} />
-      <label style={S.lab}>Paid By</label>
-      <div style={S.row}>{OWNERS.map(o=>(
-        <button key={o} onClick={()=>setF({...f,paidBy:o})} style={{...S.tog, ...(f.paidBy===o?S.togOn:{})}}>{o}</button>
-      ))}</div>
-      <label style={S.lab}>Split Among</label>
-      <div style={S.row}>{OWNERS.map(o=>(
-        <button key={o} onClick={()=>toggle(o)} style={{...S.tog, ...(f.split.includes(o)?S.togOn:{})}}>{f.split.includes(o)?"✓ ":""}{o}</button>
-      ))}</div>
-      <button style={{...S.btnPrimary, marginTop:10}} disabled={busy} onClick={save}>{busy?"Saving…":"Log Expense"}</button>
     </div>
   );
 }
@@ -214,9 +326,10 @@ function App() {
   const [hasToken, setHasToken] = useState(!!getToken());
   const [data, setData] = useState({ trips:[], fillups:[], expenses:[] });
   const [tab, setTab] = useState("trips");
-  const [adding, setAdding] = useState(false);
+  const [modal, setModal] = useState(null);   // { type, initial }
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState(null);
+  const [tlFilter, setTlFilter] = useState({ trips:true, fillups:true, expenses:true });
 
   const load = async () => {
     setLoading(true); setErr(null);
@@ -231,20 +344,43 @@ function App() {
     }
     setLoading(false);
   };
-
   useEffect(() => { if (hasToken) load(); }, [hasToken]);
 
-  if (!hasToken) return <Setup onSaved={() => setHasToken(true)} />;
+  if (!hasToken) return <Setup onSaved={()=>setHasToken(true)} />;
 
-  // balances straight from the base's formula fields
-  const balances = OWNERS.map(o => {
-    const gasNet = sum(data.fillups, F.gasPaid(o)) - sum(data.trips, F.gasOwed(o));
-    const expNet = sum(data.expenses, F.expNet(o));
-    return { owner:o, gasNet, expNet, total: gasNet + expNet };
-  });
+  const price = gasPrice(data.fillups);
+  const balances = computeBalances(data, price);
+  const closeAndReload = async () => { await load(); setModal(null); };
 
-  const Form = tab === "trips" ? TripForm : tab === "fillups" ? FillupForm : ExpenseForm;
-  const rows = data[tab];
+  const META = {
+    trips:   { dot:"#7dd3fc", icon:"⚓", label:"Trips" },
+    fillups: { dot:"#4ade80", icon:"⛽", label:"Fill-Ups" },
+    expenses:{ dot:"#fbbf24", icon:"🔧", label:"Expenses" },
+  };
+
+  const rowSummary = (type, x) => {
+    if (type==="trips") return <>
+      <div style={S.eHead}><b>{x["Trip Name"]}</b>{x["Short Trip (no gas)"] && <span style={S.badge}>SHORT</span>}<span style={S.date}>{x["Date"]}</span></div>
+      <div style={S.eMeta}><span>👥 {(x["Who Went"]||[]).join(", ")}</span>
+        {!x["Short Trip (no gas)"] && <span>⛽ ~{x["Estimated Gallons"]} gal · ${$m((Number(x["Estimated Gallons"])||0)*price)}</span>}
+        <span style={S.editHint}>tap to edit</span></div></>;
+    if (type==="fillups") return <>
+      <div style={S.eHead}><b>{x["Paid By"]} filled up</b><span style={S.date}>{x["Date"]}</span></div>
+      <div style={S.eMeta}><span>⛽ {x["Gallons"]} gal</span><span style={{color:"#4ade80"}}>+${$m(x["Total Cost"]||0)}</span>
+        <span style={{color:"#94a3b8"}}>${((Number(x["Total Cost"])||0)/(Number(x["Gallons"])||1)).toFixed(2)}/gal</span>
+        <span style={S.editHint}>tap to edit</span></div></>;
+    const split = (x["Split Among"]&&x["Split Among"].length)?x["Split Among"]:OWNERS;
+    return <>
+      <div style={S.eHead}><b>{x["Description"]}</b><span style={S.badge}>{x["Category"]}</span><span style={S.date}>{x["Date"]}</span></div>
+      <div style={S.eMeta}><span>{x["Paid By"]} paid ${$m(x["Total Cost"]||0)}</span>
+        <span style={{color:"#94a3b8"}}>${$m((Number(x["Total Cost"])||0)/split.length)}/ea · {split.length}-way</span>
+        <span style={S.editHint}>tap to edit</span></div></>;
+  };
+
+  const timelineItems = ["trips","fillups","expenses"]
+    .filter(t => tlFilter[t])
+    .flatMap(t => data[t].map(r => ({ type:t, r, date:r.fields["Date"]||"" })))
+    .sort((a,b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0));
 
   return (
     <div style={S.app}>
@@ -252,10 +388,10 @@ function App() {
         <span style={S.boat}>⚓</span>
         <div style={{ flex:1 }}>
           <div style={S.headerTitle}>VESSEL LOG</div>
-          <div style={S.sub}>Bob · Jamie · Tucker · Sea Runner</div>
+          <div style={S.sub}>Bob · Jamie · Tucker · ⛽ ${price.toFixed(2)}/gal</div>
         </div>
         <button style={S.ghost} onClick={load}>↻</button>
-        <button style={S.ghost} onClick={()=>{ clearToken(); setHasToken(false); }}>⏏ token</button>
+        <button style={S.ghost} onClick={()=>{ clearToken(); setHasToken(false); }}>⏏</button>
       </div>
 
       <div style={S.cards}>
@@ -271,41 +407,59 @@ function App() {
       </div>
 
       <div style={S.tabs}>
-        {[["trips","TRIPS"],["fillups","FILL-UPS"],["expenses","EXPENSES"]].map(([k,l])=>(
-          <button key={k} onClick={()=>{setTab(k); setAdding(false);}} style={{...S.tab, ...(tab===k?S.tabOn:{})}}>{l}</button>
+        {[["trips","TRIPS"],["fillups","FILL-UPS"],["expenses","EXPENSES"],["timeline","TIMELINE"]].map(([k,l])=>(
+          <button key={k} onClick={()=>setTab(k)} style={{ ...S.tab, ...(tab===k?S.tabOn:{}) }}>{l}</button>
         ))}
       </div>
 
       <div style={{ padding:"16px 20px" }}>
-        <button style={S.btnAdd} onClick={()=>setAdding(a=>!a)}>{adding?"× Close":"+ Add"}</button>
-        {adding && <Form onDone={()=>{ setAdding(false); load(); }} />}
-
         {err && <div style={S.err}>Error: {err}</div>}
+
+        {tab !== "timeline" && (
+          <button style={S.btnAdd} onClick={()=>setModal({ type:tab, initial:null })}>+ Add</button>
+        )}
+
         {loading && <div style={S.empty}>Loading…</div>}
-        {!loading && rows.length===0 && <div style={S.empty}>Nothing logged yet.</div>}
 
-        {!loading && rows.map(r => {
-          const x = r.fields;
-          return (
-            <div key={r.id} style={S.entry}>
-              {tab==="trips" && <>
-                <div style={S.eHead}><b>{x["Trip Name"]}</b>{x["Short Trip (no gas)"] && <span style={S.badge}>SHORT</span>}<span style={S.date}>{x["Date"]}</span></div>
-                <div style={S.eMeta}><span>👥 {(x["Who Went"]||[]).join(", ")}</span>{!x["Short Trip (no gas)"] && <span>⛽ ~{x["Estimated Gallons"]} gal · ${$m(x["Est. Gas Cost"]||0)}</span>}</div>
-              </>}
-              {tab==="fillups" && <>
-                <div style={S.eHead}><b>{x["Paid By"]} filled up</b><span style={S.date}>{x["Date"]}</span></div>
-                <div style={S.eMeta}><span>⛽ {x["Gallons"]} gal</span><span style={{color:"#4ade80"}}>+${$m(x["Total Cost"]||0)}</span></div>
-              </>}
-              {tab==="expenses" && <>
-                <div style={S.eHead}><b>{x["Description"]}</b><span style={S.badge}>{x["Category"]}</span><span style={S.date}>{x["Date"]}</span></div>
-                <div style={S.eMeta}><span>{x["Paid By"]} paid ${$m(x["Total Cost"]||0)}</span><span style={{color:"#94a3b8"}}>${$m(x["Per Person"]||0)}/ea</span></div>
-              </>}
-            </div>
-          );
-        })}
+        {!loading && tab !== "timeline" && data[tab].map(r => (
+          <div key={r.id} style={S.entry} onClick={()=>setModal({ type:tab, initial:r })}>
+            {rowSummary(tab, r.fields)}
+            <Thumbs photos={r.fields["Photos"]} />
+          </div>
+        ))}
+        {!loading && tab !== "timeline" && data[tab].length===0 && <div style={S.empty}>Nothing logged yet.</div>}
 
-        <div style={S.note}>📷 Add photos to any entry from the Airtable mobile app or a public Form — they'll show up here on refresh.</div>
+        {tab === "timeline" && <>
+          <div style={S.filterRow}>
+            {Object.entries(META).map(([k,m])=>(
+              <button key={k} onClick={()=>setTlFilter(s=>({ ...s, [k]:!s[k] }))}
+                style={{ ...S.filterChip, ...(tlFilter[k] ? { borderColor:m.dot, color:m.dot } : { opacity:0.4 }) }}>
+                <span style={{ ...S.fdot, background:m.dot }} />{m.label}
+              </button>
+            ))}
+          </div>
+          {!loading && timelineItems.length===0 && <div style={S.empty}>Nothing to show.</div>}
+          <div style={{ position:"relative", paddingLeft:4 }}>
+            {timelineItems.length>0 && <div style={S.spine} />}
+            {timelineItems.map(({type,r}) => (
+              <div key={type+r.id} style={S.tlItem} onClick={()=>setModal({ type, initial:r })}>
+                <div style={S.tlMarker}><span style={{ ...S.tlDot, background:META[type].dot }} /></div>
+                <div style={S.tlCard}>
+                  <div style={S.eHead}><span>{META[type].icon}</span>
+                    <b>{type==="trips"?r.fields["Trip Name"]:type==="fillups"?`${r.fields["Paid By"]} filled up`:r.fields["Description"]}</b>
+                    <span style={S.date}>{r.fields["Date"]}</span></div>
+                  <Thumbs photos={r.fields["Photos"]} />
+                </div>
+              </div>
+            ))}
+          </div>
+        </>}
+
+        <div style={S.note}>📷 Tap any entry to edit it, change who came, or add photos. Photos also sync from the Airtable mobile app.</div>
       </div>
+
+      {modal && <EntryModal type={modal.type} initial={modal.initial}
+        onClose={()=>setModal(null)} onSaved={closeAndReload} refetch={load} />}
     </div>
   );
 }
@@ -318,7 +472,7 @@ const S = {
   boat:{ fontSize:28 },
   headerTitle:{ fontSize:20, fontWeight:700, letterSpacing:3, color:"#7dd3fc" },
   sub:{ fontSize:11, color:"#475569", letterSpacing:1 },
-  ghost:{ background:"#0f2a4a", border:"1px solid #1e3a5f", color:"#7dd3fc", borderRadius:8, padding:"6px 10px", fontSize:11, cursor:"pointer" },
+  ghost:{ background:"#0f2a4a", border:"1px solid #1e3a5f", color:"#7dd3fc", borderRadius:8, padding:"6px 10px", fontSize:13, cursor:"pointer" },
   cards:{ display:"grid", gridTemplateColumns:"repeat(3,1fr)", gap:10, padding:"16px 20px" },
   card:{ background:"#0f1e35", border:"1px solid #1e3a5f", borderRadius:8, padding:"12px 14px" },
   cardName:{ fontSize:13, fontWeight:700, color:"#7dd3fc", marginBottom:8 },
@@ -326,24 +480,43 @@ const S = {
   mini:{ color:"#475569" },
   div:{ borderTop:"1px solid #1e3a5f", margin:"6px 0" },
   tabs:{ display:"flex", padding:"0 20px", borderBottom:"1px solid #1e3a5f" },
-  tab:{ background:"none", border:"none", borderBottom:"2px solid transparent", color:"#475569", fontSize:11, letterSpacing:2, padding:"10px 14px", cursor:"pointer" },
+  tab:{ background:"none", border:"none", borderBottom:"2px solid transparent", color:"#475569", fontSize:11, letterSpacing:2, padding:"10px 12px", cursor:"pointer" },
   tabOn:{ color:"#7dd3fc", borderBottomColor:"#7dd3fc" },
   btnAdd:{ background:"#0f2a4a", border:"1px solid #1e3a5f", color:"#7dd3fc", fontSize:12, letterSpacing:1, padding:"8px 16px", borderRadius:6, cursor:"pointer", marginBottom:14 },
-  form:{ display:"flex", flexDirection:"column", gap:6, background:"#0d1829", border:"1px solid #1e2d40", borderRadius:8, padding:16, marginBottom:16 },
-  lab:{ fontSize:10, letterSpacing:1, color:"#475569" },
-  input:{ background:"#0a0f1a", border:"1px solid #1e3a5f", borderRadius:6, color:"#e2e8f0", fontSize:13, padding:"8px 10px", width:"100%" },
-  row:{ display:"flex", gap:6 },
-  tog:{ flex:1, background:"#0a0f1a", border:"1px solid #1e3a5f", color:"#475569", fontSize:12, padding:"7px", borderRadius:6, cursor:"pointer" },
-  togOn:{ background:"#0f2a4a", border:"1px solid #7dd3fc", color:"#7dd3fc" },
-  btnPrimary:{ background:"#1e4a7a", border:"none", color:"#7dd3fc", fontSize:12, letterSpacing:1, padding:"10px", borderRadius:6, cursor:"pointer" },
-  entry:{ background:"#0d1829", border:"1px solid #1e2d40", borderRadius:8, padding:"10px 14px", marginBottom:8 },
+  entry:{ background:"#0d1829", border:"1px solid #1e2d40", borderRadius:8, padding:"10px 14px", marginBottom:8, cursor:"pointer" },
   eHead:{ display:"flex", alignItems:"center", gap:8, flexWrap:"wrap", marginBottom:5, color:"#cbd5e1", fontSize:13 },
-  eMeta:{ display:"flex", gap:14, fontSize:11, color:"#64748b", flexWrap:"wrap" },
+  eMeta:{ display:"flex", gap:14, fontSize:11, color:"#64748b", flexWrap:"wrap", alignItems:"center" },
+  editHint:{ marginLeft:"auto", color:"#1e3a5f", fontSize:9, letterSpacing:1 },
   date:{ marginLeft:"auto", fontSize:10, color:"#475569" },
   badge:{ fontSize:9, letterSpacing:1, background:"#1e3a5f", color:"#7dd3fc", padding:"2px 6px", borderRadius:4 },
   empty:{ color:"#334155", textAlign:"center", padding:"24px", fontSize:12 },
   err:{ background:"#3b0d0d", border:"1px solid #7f1d1d", color:"#fca5a5", padding:"10px 12px", borderRadius:6, fontSize:12, marginBottom:12 },
   note:{ marginTop:16, fontSize:11, color:"#475569", textAlign:"center", lineHeight:1.6 },
+  thumb:{ width:54, height:54, objectFit:"cover", borderRadius:6, border:"1px solid #1e2d40" },
+  thumbBig:{ width:72, height:72, objectFit:"cover", borderRadius:6, border:"1px solid #1e3a5f" },
+  thumbX:{ position:"absolute", top:-6, right:-6, background:"#7f1d1d", color:"#fff", border:"none", borderRadius:"50%", width:20, height:20, cursor:"pointer", fontSize:12, lineHeight:1 },
+  // modal
+  overlay:{ position:"fixed", inset:0, background:"rgba(0,0,0,0.75)", display:"flex", alignItems:"center", justifyContent:"center", padding:16, zIndex:100 },
+  modal:{ background:"#0d1829", border:"1px solid #1e3a5f", borderRadius:12, padding:22, width:"min(440px,94vw)", maxHeight:"90vh", overflowY:"auto", display:"flex", flexDirection:"column", gap:6 },
+  modalTitle:{ fontSize:14, fontWeight:700, letterSpacing:2, color:"#7dd3fc", marginBottom:8 },
+  lab:{ fontSize:10, letterSpacing:1, color:"#475569" },
+  input:{ background:"#0a0f1a", border:"1px solid #1e3a5f", borderRadius:6, color:"#e2e8f0", fontSize:13, padding:"8px 10px", width:"100%" },
+  row:{ display:"flex", gap:6, flexWrap:"wrap" },
+  tog:{ flex:1, background:"#0a0f1a", border:"1px solid #1e3a5f", color:"#475569", fontSize:12, padding:"7px", borderRadius:6, cursor:"pointer" },
+  togOn:{ background:"#0f2a4a", border:"1px solid #7dd3fc", color:"#7dd3fc" },
+  btnRow:{ display:"flex", gap:8, marginTop:14 },
+  btnPrimary:{ background:"#1e4a7a", border:"none", color:"#7dd3fc", fontSize:12, letterSpacing:1, padding:"10px", borderRadius:6, cursor:"pointer" },
+  btnGhost:{ background:"none", border:"1px solid #1e3a5f", color:"#475569", fontSize:12, padding:"10px 14px", borderRadius:6, cursor:"pointer" },
+  btnDelete:{ background:"none", border:"1px solid #7f1d1d", color:"#f87171", fontSize:12, padding:"10px 14px", borderRadius:6, cursor:"pointer" },
+  // timeline
+  filterRow:{ display:"flex", gap:8, marginBottom:16, flexWrap:"wrap" },
+  filterChip:{ display:"flex", alignItems:"center", gap:6, background:"#0d1829", border:"1px solid #1e3a5f", borderRadius:20, padding:"5px 12px", fontSize:11, color:"#64748b", cursor:"pointer", letterSpacing:1 },
+  fdot:{ width:8, height:8, borderRadius:"50%", display:"inline-block" },
+  spine:{ position:"absolute", left:9, top:14, bottom:14, width:1, background:"#1e2d40" },
+  tlItem:{ display:"flex", gap:12, cursor:"pointer", position:"relative" },
+  tlMarker:{ width:12, display:"flex", justifyContent:"center", paddingTop:14 },
+  tlDot:{ width:12, height:12, borderRadius:"50%", boxShadow:"0 0 0 3px #0a0f1a" },
+  tlCard:{ flex:1, background:"#0d1829", border:"1px solid #1e2d40", borderRadius:8, padding:"10px 14px", marginBottom:8 },
 };
 
 ReactDOM.createRoot(document.getElementById("root")).render(<App />);
